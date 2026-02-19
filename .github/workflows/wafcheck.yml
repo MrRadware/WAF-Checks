@@ -1,0 +1,125 @@
+name: WAF Health Check via IP Override
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Full HTTPS URL (https://host/path)"
+        required: true
+        type: string
+      ip:
+        description: "Target IP to force-connect to"
+        required: true
+        type: string
+      seconds:
+        description: "How many seconds to run"
+        required: false
+        default: "10"
+        type: string
+      interval_ms:
+        description: "Interval between requests (ms)"
+        required: false
+        default: "1000"
+        type: string
+      insecure_tls:
+        description: "Skip TLS verification (-k)"
+        required: false
+        default: "true"
+        type: string
+      expected_http:
+        description: "Expected HTTP code (optional, e.g. 200)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  hc_test:
+    name: Run Health Check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: [1,2,3,4,5]  # parallel agents
+
+    steps:
+      - name: Show runner info
+        run: |
+          RUNNER_IP=$(curl -s https://api.ipify.org || true)
+          RUNNER_COUNTRY=$(curl -s https://ipinfo.io/country || true)
+          echo "Runner IP: $RUNNER_IP"
+          echo "Runner Country: $RUNNER_COUNTRY"
+          echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
+          echo "RUNNER_COUNTRY=$RUNNER_COUNTRY" >> $GITHUB_ENV
+
+      - name: Execute curl probe
+        env:
+          URL: ${{ inputs.url }}
+          IP: ${{ inputs.ip }}
+          DURATION: ${{ inputs.seconds }}
+          INTERVAL_MS: ${{ inputs.interval_ms }}
+          INSECURE_TLS: ${{ inputs.insecure_tls }}
+          EXPECTED_HTTP: ${{ inputs.expected_http }}
+          AGENT: ${{ matrix.agent }}
+        run: |
+          set -euo pipefail
+
+          host=$(echo "$URL" | awk -F[/:] '{print $4}')
+          proto=$(echo "$URL" | awk -F: '{print $1}')
+
+          if [ "$proto" != "https" ]; then
+            echo "Only HTTPS supported"
+            exit 1
+          fi
+
+          echo "agent=$AGENT url=$URL host=$host ip=$IP duration=${DURATION}s interval_ms=$INTERVAL_MS"
+
+          echo "ts,agent,runner_ip,runner_country,http_code,remote_ip,ssl_verify,time_connect,time_tls,time_ttfb,time_total" > results_${AGENT}.csv
+
+          start=$(date +%s)
+          end=$((start + DURATION))
+          total=0
+          failures=0
+
+          while [ "$(date +%s)" -lt "$end" ]; do
+            ts=$(date -Is)
+            curl_args=(-sS -o /dev/null
+              --resolve "${host}:443:${IP}"
+              -w "%{http_code},%{remote_ip},%{ssl_verify_result},%{time_connect},%{time_appconnect},%{time_starttransfer},%{time_total}"
+              "$URL"
+            )
+
+            if [[ "$INSECURE_TLS" == "true" ]]; then
+              curl_args=(-k "${curl_args[@]}")
+            fi
+
+            out=$(curl "${curl_args[@]}" 2>/dev/null || echo "000,0,0,0,0,0,0")
+            http_code=$(echo "$out" | cut -d',' -f1)
+
+            if [[ -n "$EXPECTED_HTTP" && "$http_code" != "$EXPECTED_HTTP" ]]; then
+              failures=$((failures+1))
+            fi
+
+            echo "$ts,$AGENT,${RUNNER_IP:-},${RUNNER_COUNTRY:-},$out" >> results_${AGENT}.csv
+            total=$((total+1))
+
+            sleep_sec=$(awk "BEGIN {print $INTERVAL_MS/1000}")
+            sleep $sleep_sec
+          done
+
+          echo "Total requests: $total"
+          echo "Failures: $failures"
+
+          echo "## Summary (Agent $AGENT)" >> $GITHUB_STEP_SUMMARY
+          echo "- Total: $total" >> $GITHUB_STEP_SUMMARY
+          echo "- Failures: $failures" >> $GITHUB_STEP_SUMMARY
+
+          if [[ -n "$EXPECTED_HTTP" && "$failures" -gt 0 ]]; then
+            echo "Failing job due to HTTP mismatch"
+            exit 1
+          fi
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: hc-results-agent-${{ matrix.agent }}
+          path: results_${{ matrix.agent }}.csv
