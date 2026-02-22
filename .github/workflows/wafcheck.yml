@@ -1,4 +1,4 @@
-name: Internal CWAAF Multi-Region Health Check
+name: Internal CWAAF IP Health Check
 
 on:
   workflow_dispatch:
@@ -31,62 +31,39 @@ on:
         required: false
         default: "100"
         type: string
-      num_probes:
-        description: "How many probes to run (1-3). Will pick US, EU, APAC in order."
+      runner_region:
+        description: "Choose the region/probe for the runner"
         required: false
-        default: "3"
-        type: string
+        default: "us"
+        type: choice
+        options:
+          - us
+          - europe
+          - asia
 
 jobs:
-  hc_test_region:
-    name: HC Test - ${{ matrix.region }}
+  hc_test:
+    name: Run HC Test on Multiple Agents
+    runs-on: ${{ fromJSON('{"us":"ubuntu-latest","europe":"ubuntu-20.04","asia":"ubuntu-22.04"}')[github.event.inputs.runner_region] }}
     strategy:
       fail-fast: false
+      max-parallel: 3
       matrix:
-        region: [us, europe, asia]
-    runs-on: ${{ fromJSON('{"us":"ubuntu-latest","europe":"ubuntu-20.04","asia":"ubuntu-22.04"}')[matrix.region] }}
+        agent: [1, 2, 3, 4, 5]
 
     steps:
-      - name: Determine if region should run
-        id: check_region
-        shell: bash
-        run: |
-          NUM_PROBES=${{ inputs.num_probes }}
-          allowed_regions=()
-          [[ "$NUM_PROBES" -ge 1 ]] && allowed_regions+=("us")
-          [[ "$NUM_PROBES" -ge 2 ]] && allowed_regions+=("europe")
-          [[ "$NUM_PROBES" -ge 3 ]] && allowed_regions+=("asia")
-
-          if [[ ! " ${allowed_regions[@]} " =~ " ${matrix.region} " ]]; then
-            echo "Skipping region ${matrix.region} as it's beyond num_probes=${NUM_PROBES}"
-            echo "skip=true" >> "$GITHUB_ENV"
-          else
-            echo "skip=false" >> "$GITHUB_ENV"
-
-      - name: Skip this region if not selected
-        if: env.skip == 'true'
-        run: |
-          echo "Region ${{ matrix.region }} skipped"
-          exit 0
-
-      - name: Show runner public IP + geo info
+      - name: Show runner public IP + country
         shell: bash
         run: |
           set -euo pipefail
           RUNNER_IP="$(curl -s https://api.ipify.org || true)"
           RUNNER_COUNTRY="$(curl -s https://ipinfo.io/country || true)"
-          RUNNER_CITY="$(curl -s https://ipinfo.io/city || true)"
-          RUNNER_ASN="$(curl -s https://ipinfo.io/org || true)"
-          echo "Runner IP: $RUNNER_IP"
-          echo "Country: $RUNNER_COUNTRY"
-          echo "City: $RUNNER_CITY"
-          echo "ASN: $RUNNER_ASN"
-          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
-          echo "RUNNER_COUNTRY=$RUNNER_COUNTRY" >> "$GITHUB_ENV"
-          echo "RUNNER_CITY=$RUNNER_CITY" >> "$GITHUB_ENV"
-          echo "RUNNER_ASN=$RUNNER_ASN" >> "$GITHUB_ENV"
+          echo "Runner public IP: ${RUNNER_IP}"
+          echo "Runner country: ${RUNNER_COUNTRY}"
+          echo "RUNNER_IP=${RUNNER_IP}" >> "$GITHUB_ENV"
+          echo "RUNNER_COUNTRY=${RUNNER_COUNTRY}" >> "$GITHUB_ENV"
 
-      - name: Run HC test for all agents sequentially
+      - name: Run HC test with --resolve
         shell: bash
         env:
           URL: ${{ inputs.url }}
@@ -94,12 +71,11 @@ jobs:
           DURATION: ${{ inputs.seconds }}
           INTERVAL_MS: ${{ inputs.interval_ms }}
           INSECURE_TLS: ${{ inputs.insecure_tls }}
+          AGENT: ${{ matrix.agent }}
           FAIL_THRESHOLD: ${{ inputs.fail_threshold_pct }}
           RUNNER_IP: ${{ env.RUNNER_IP }}
           RUNNER_COUNTRY: ${{ env.RUNNER_COUNTRY }}
-          RUNNER_CITY: ${{ env.RUNNER_CITY }}
-          RUNNER_ASN: ${{ env.RUNNER_ASN }}
-          REGION: ${{ matrix.region }}
+          REGION: ${{ inputs.runner_region }}
         run: |
           set -euo pipefail
 
@@ -108,71 +84,65 @@ jobs:
           if ! [[ "$INTERVAL_MS" =~ ^[0-9]+$ ]]; then echo "Invalid interval_ms value"; exit 1; fi
           if ! [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "Invalid IPv4 format"; exit 1; fi
 
+          # Parse host from URL
           host="$(echo "$URL" | sed -E 's#^https?://([^/:]+).*#\1#')"
           proto="$(echo "$URL" | sed -E 's#^(https?).*#\1#')"
           if [ "$proto" != "https" ]; then echo "Only https supported"; exit 1; fi
           port="443"
 
-          FAILED_AGENTS=0
+          echo "agent=$AGENT region=$REGION url=$URL host=$host ip=$IP duration=${DURATION}s interval_ms=$INTERVAL_MS insecure_tls=$INSECURE_TLS runner_ip=${RUNNER_IP:-} runner_country=${RUNNER_COUNTRY:-}"
 
-          for AGENT in 1 2 3 4 5; do
-            result_file="results_${REGION}_agent_${AGENT}.csv"
-            echo "ts,agent,region,runner_ip,runner_country,runner_city,runner_asn,http_code,remote_ip,ssl_verify_result,time_connect,time_appconnect,time_starttransfer,time_total" > "$result_file"
+          result_file="results_agent_${AGENT}.csv"
+          echo "ts,agent,region,runner_ip,runner_country,http_code,remote_ip,ssl_verify_result,time_connect,time_appconnect,time_starttransfer,time_total" > "$result_file"
 
-            start_epoch="$(date +%s)"
-            end_epoch="$((start_epoch + DURATION))"
-            count=0
-            errors=0
+          start_epoch="$(date +%s)"
+          end_epoch="$((start_epoch + DURATION))"
+          count=0
+          errors=0
 
-            while [ "$(date +%s)" -lt "$end_epoch" ]; do
-              ts="$(date -Is)"
-              count=$((count+1))
+          while [ "$(date +%s)" -lt "$end_epoch" ]; do
+            ts="$(date -Is)"
+            count=$((count+1))
 
-              curl_args=(
-                -sS
-                -o /dev/null
-                --connect-timeout 5
-                --max-time 15
-                --resolve "${host}:${port}:${IP}"
-                -H "User-Agent: Internal-HC-Agent-${AGENT}"
-                -w "%{http_code},%{remote_ip},%{ssl_verify_result},%{time_connect},%{time_appconnect},%{time_starttransfer},%{time_total}"
-                "$URL"
-              )
+            curl_args=(
+              -sS
+              -o /dev/null
+              --connect-timeout 5
+              --max-time 15
+              --resolve "${host}:${port}:${IP}"
+              -H "User-Agent: Internal-HC-Agent-${AGENT}"
+              -w "%{http_code},%{remote_ip},%{ssl_verify_result},%{time_connect},%{time_appconnect},%{time_starttransfer},%{time_total}"
+              "$URL"
+            )
 
-              if [[ "$INSECURE_TLS" == "true" || "$INSECURE_TLS" == "1" ]]; then
-                curl_args=(-k "${curl_args[@]}")
-              fi
-
-              out="$(curl "${curl_args[@]}" 2>&1)"
-              rc=$?
-              if [ $rc -ne 0 ]; then
-                out="curl_error_${rc},0,0,0,0,0,0"
-                errors=$((errors+1))
-              fi
-
-              echo "${ts},${AGENT},${REGION},${RUNNER_IP:-},${RUNNER_COUNTRY:-},${RUNNER_CITY:-},${RUNNER_ASN:-},${out}" | tee -a "$result_file" >/dev/null
-
-              jitter=$(shuf -i 0-200 -n 1)
-              sleep "$(awk "BEGIN {print ($INTERVAL_MS + $jitter)/1000}")"
-            done
-
-            echo "Agent $AGENT in $REGION finished. Total requests: $count, Total errors: $errors"
-
-            error_rate=$((errors * 100 / count))
-            echo "Error rate: ${error_rate}%"
-            if [ "$error_rate" -gt "$FAIL_THRESHOLD" ]; then
-              echo "Error rate exceeds threshold (${FAIL_THRESHOLD}%) for agent $AGENT"
-              FAILED_AGENTS=$((FAILED_AGENTS+1))
+            if [ "$INSECURE_TLS" = "true" ] || [ "$INSECURE_TLS" = "1" ]; then
+              curl_args=(-k "${curl_args[@]}")
             fi
+
+            out="$(curl "${curl_args[@]}" 2>&1)"
+            rc=$?
+            if [ $rc -ne 0 ]; then
+              out="curl_error_${rc},0,0,0,0,0,0"
+              errors=$((errors+1))
+            fi
+
+            echo "${ts},${AGENT},${REGION},${RUNNER_IP:-},${RUNNER_COUNTRY:-},${out}" | tee -a "$result_file" >/dev/null
+
+            jitter=$(shuf -i 0-200 -n 1)
+            sleep "$(awk "BEGIN {print ($INTERVAL_MS + $jitter)/1000}")"
           done
 
-          if [ "$FAILED_AGENTS" -gt 0 ]; then
-            echo "$FAILED_AGENTS agent(s) failed in region $REGION"
+          echo "Agent $AGENT finished. Total requests: $count, Total errors: $errors"
+
+          error_rate=$((errors * 100 / count))
+          echo "Error rate: ${error_rate}%"
+          if [ "$error_rate" -gt "$FAIL_THRESHOLD" ]; then
+            echo "Error rate exceeds threshold (${FAIL_THRESHOLD}%)"
             exit 1
           fi
 
       - name: Upload per-agent results
         uses: actions/upload-artifact@v4
         with:
-          name: hc-results-${{ matrix.region }}-agent
-          path: results_${{ matrix.region }}_agent_*.csv
+          name: hc-results-${{ inputs.runner_region }}-agent-${{ matrix.agent }}
+          path: results_agent_${{ matrix.agent }}.csv
