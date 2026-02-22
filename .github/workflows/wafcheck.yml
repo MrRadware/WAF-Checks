@@ -11,6 +11,17 @@ on:
         description: "Target IP to force-connect to (CWAAF IP). Example: 203.0.113.10"
         required: true
         type: string
+      num_probes:
+        description: "How many probes to run (1-5)"
+        required: true
+        default: "3"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
       seconds:
         description: "How many seconds to run"
         required: false
@@ -34,16 +45,35 @@ on:
 
 jobs:
   hc_test:
-    name: Run HC Test on Multiple Agents
+    name: HC Test - Agent ${{ matrix.agent }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 5
       matrix:
         agent: [1, 2, 3, 4, 5]
 
     steps:
+      - name: Skip if agent is above selected probe count
+        id: skip_check
+        shell: bash
+        run: |
+          SELECTED="${{ inputs.num_probes }}"
+          CURRENT="${{ matrix.agent }}"
+
+          if [ "$CURRENT" -gt "$SELECTED" ]; then
+            echo "Skipping agent $CURRENT (selected probes: $SELECTED)"
+            echo "SKIP=true" >> "$GITHUB_ENV"
+          else
+            echo "SKIP=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Stop execution if skipped
+        if: env.SKIP == 'true'
+        run: exit 0
+
       - name: Show runner public IP + country
+        if: env.SKIP != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -55,6 +85,7 @@ jobs:
           echo "RUNNER_COUNTRY=${RUNNER_COUNTRY}" >> "$GITHUB_ENV"
 
       - name: Run HC test with --resolve
+        if: env.SKIP != 'true'
         shell: bash
         env:
           URL: ${{ inputs.url }}
@@ -69,18 +100,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Input validation
           if ! [[ "$DURATION" =~ ^[0-9]+$ ]]; then echo "Invalid seconds value"; exit 1; fi
           if ! [[ "$INTERVAL_MS" =~ ^[0-9]+$ ]]; then echo "Invalid interval_ms value"; exit 1; fi
           if ! [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "Invalid IPv4 format"; exit 1; fi
 
-          # Parse host from URL
           host="$(echo "$URL" | sed -E 's#^https?://([^/:]+).*#\1#')"
           proto="$(echo "$URL" | sed -E 's#^(https?).*#\1#')"
           if [ "$proto" != "https" ]; then echo "Only https supported"; exit 1; fi
           port="443"
-
-          echo "agent=$AGENT url=$URL host=$host ip=$IP duration=${DURATION}s interval_ms=$INTERVAL_MS insecure_tls=$INSECURE_TLS runner_ip=${RUNNER_IP:-} runner_country=${RUNNER_COUNTRY:-}"
 
           result_file="results_agent_${AGENT}.csv"
           echo "ts,agent,runner_ip,runner_country,http_code,remote_ip,ssl_verify_result,time_connect,time_appconnect,time_starttransfer,time_total" > "$result_file"
@@ -109,30 +136,26 @@ jobs:
               curl_args=(-k "${curl_args[@]}")
             fi
 
-            out="$(curl "${curl_args[@]}" 2>&1)"
-            rc=$?
-            if [ $rc -ne 0 ]; then
-              out="curl_error_${rc},0,0,0,0,0,0"
+            out="$(curl "${curl_args[@]}" 2>&1)" || {
+              out="curl_error,0,0,0,0,0,0"
               errors=$((errors+1))
-            fi
+            }
 
-            echo "${ts},${AGENT},${RUNNER_IP:-},${RUNNER_COUNTRY:-},${out}" | tee -a "$result_file" >/dev/null
+            echo "${ts},${AGENT},${RUNNER_IP:-},${RUNNER_COUNTRY:-},${out}" >> "$result_file"
 
-            jitter=$(shuf -i 0-200 -n 1)
-            sleep "$(awk "BEGIN {print ($INTERVAL_MS + $jitter)/1000}")"
+            sleep "$(awk "BEGIN {print $INTERVAL_MS/1000}")"
           done
 
-          echo "Agent $AGENT finished. Total requests: $count, Total errors: $errors"
-
-          # Optional fail threshold
           error_rate=$((errors * 100 / count))
-          echo "Error rate: ${error_rate}%"
+          echo "Agent $AGENT finished. Error rate: ${error_rate}%"
+
           if [ "$error_rate" -gt "$FAIL_THRESHOLD" ]; then
             echo "Error rate exceeds threshold (${FAIL_THRESHOLD}%)"
             exit 1
           fi
 
       - name: Upload per-agent results
+        if: env.SKIP != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: hc-results-agent-${{ matrix.agent }}
