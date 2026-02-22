@@ -1,4 +1,4 @@
-name: Internal CWAAF IP Health Check with Combined Results
+name: Internal CWAAF IP Health Check
 
 on:
   workflow_dispatch:
@@ -118,7 +118,6 @@ jobs:
 
             echo "${ts},${AGENT},${RUNNER_IP:-},${RUNNER_COUNTRY:-},${out}" | tee -a "$result_file" >/dev/null
 
-            # Sleep with optional jitter
             jitter=$(shuf -i 0-200 -n 1)
             sleep "$(awk "BEGIN {print ($INTERVAL_MS + $jitter)/1000}")"
           done
@@ -138,36 +137,3 @@ jobs:
         with:
           name: hc-results-agent-${{ matrix.agent }}
           path: results_agent_${{ matrix.agent }}.csv
-
-  merge_results:
-    name: Merge All Agent Results
-    runs-on: ubuntu-latest
-    needs: hc_test
-    steps:
-      - name: Download all agent artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Merge CSVs into single file
-        shell: bash
-        run: |
-          set -euo pipefail
-          output="hc-results-combined.csv"
-
-          # Keep header from first CSV
-          first_csv=$(ls artifacts | head -n1)
-          head -n1 "artifacts/$first_csv" > "$output"
-
-          # Append all CSVs excluding their headers
-          for f in artifacts/*.csv; do
-            tail -n +2 "$f" >> "$output"
-          done
-
-          echo "Merged CSV created: $output"
-
-      - name: Upload merged results
-        uses: actions/upload-artifact@v4
-        with:
-          name: hc-results-combined
-          path: hc-results-combined.csv
