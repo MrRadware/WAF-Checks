@@ -31,20 +31,11 @@ on:
         required: false
         default: "100"
         type: string
-      runner_region:
-        description: "Choose the region/probe for the runner"
-        required: false
-        default: "us"
-        type: choice
-        options:
-          - us
-          - europe
-          - asia
 
 jobs:
   hc_test:
     name: Run HC Test on Multiple Agents
-    runs-on: ${{ fromJSON('{"us":"ubuntu-latest","europe":"ubuntu-20.04","asia":"ubuntu-22.04"}')[github.event.inputs.runner_region] }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       max-parallel: 3
@@ -75,7 +66,6 @@ jobs:
           FAIL_THRESHOLD: ${{ inputs.fail_threshold_pct }}
           RUNNER_IP: ${{ env.RUNNER_IP }}
           RUNNER_COUNTRY: ${{ env.RUNNER_COUNTRY }}
-          REGION: ${{ inputs.runner_region }}
         run: |
           set -euo pipefail
 
@@ -90,10 +80,10 @@ jobs:
           if [ "$proto" != "https" ]; then echo "Only https supported"; exit 1; fi
           port="443"
 
-          echo "agent=$AGENT region=$REGION url=$URL host=$host ip=$IP duration=${DURATION}s interval_ms=$INTERVAL_MS insecure_tls=$INSECURE_TLS runner_ip=${RUNNER_IP:-} runner_country=${RUNNER_COUNTRY:-}"
+          echo "agent=$AGENT url=$URL host=$host ip=$IP duration=${DURATION}s interval_ms=$INTERVAL_MS insecure_tls=$INSECURE_TLS runner_ip=${RUNNER_IP:-} runner_country=${RUNNER_COUNTRY:-}"
 
           result_file="results_agent_${AGENT}.csv"
-          echo "ts,agent,region,runner_ip,runner_country,http_code,remote_ip,ssl_verify_result,time_connect,time_appconnect,time_starttransfer,time_total" > "$result_file"
+          echo "ts,agent,runner_ip,runner_country,http_code,remote_ip,ssl_verify_result,time_connect,time_appconnect,time_starttransfer,time_total" > "$result_file"
 
           start_epoch="$(date +%s)"
           end_epoch="$((start_epoch + DURATION))"
@@ -126,7 +116,7 @@ jobs:
               errors=$((errors+1))
             fi
 
-            echo "${ts},${AGENT},${REGION},${RUNNER_IP:-},${RUNNER_COUNTRY:-},${out}" | tee -a "$result_file" >/dev/null
+            echo "${ts},${AGENT},${RUNNER_IP:-},${RUNNER_COUNTRY:-},${out}" | tee -a "$result_file" >/dev/null
 
             jitter=$(shuf -i 0-200 -n 1)
             sleep "$(awk "BEGIN {print ($INTERVAL_MS + $jitter)/1000}")"
@@ -134,6 +124,7 @@ jobs:
 
           echo "Agent $AGENT finished. Total requests: $count, Total errors: $errors"
 
+          # Optional fail threshold
           error_rate=$((errors * 100 / count))
           echo "Error rate: ${error_rate}%"
           if [ "$error_rate" -gt "$FAIL_THRESHOLD" ]; then
@@ -144,5 +135,5 @@ jobs:
       - name: Upload per-agent results
         uses: actions/upload-artifact@v4
         with:
-          name: hc-results-${{ inputs.runner_region }}-agent-${{ matrix.agent }}
+          name: hc-results-agent-${{ matrix.agent }}
           path: results_agent_${{ matrix.agent }}.csv
