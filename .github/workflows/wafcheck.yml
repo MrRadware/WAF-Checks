@@ -33,12 +33,12 @@ on:
         default: "1000"
         type: string
       insecure_tls:
-        description: "Skip TLS verification (-k). Use true if cert/SNI mismatch is expected."
+        description: "Skip TLS verification (-k)"
         required: false
         default: "false"
         type: string
       fail_threshold_pct:
-        description: "Optional: fail workflow if error rate exceeds this percent"
+        description: "Fail workflow if error rate exceeds this percent"
         required: false
         default: "100"
         type: string
@@ -47,6 +47,7 @@ jobs:
   hc_test:
     name: HC Test - Agent ${{ matrix.agent }}
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -54,38 +55,41 @@ jobs:
         agent: [1, 2, 3, 4, 5]
 
     steps:
-      - name: Skip if agent is above selected probe count
-        id: skip_check
+      # ----------------------------------------------------
+      # Decide whether this agent should run
+      # ----------------------------------------------------
+      - name: Determine if this agent should run
+        id: probe_check
         shell: bash
         run: |
           SELECTED="${{ inputs.num_probes }}"
           CURRENT="${{ matrix.agent }}"
 
-          if [ "$CURRENT" -gt "$SELECTED" ]; then
-            echo "Skipping agent $CURRENT (selected probes: $SELECTED)"
-            echo "SKIP=true" >> "$GITHUB_ENV"
+          if [ "$CURRENT" -le "$SELECTED" ]; then
+            echo "run_probe=true" >> $GITHUB_OUTPUT
           else
-            echo "SKIP=false" >> "$GITHUB_ENV"
+            echo "run_probe=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Stop execution if skipped
-        if: env.SKIP == 'true'
-        run: exit 0
-
+      # ----------------------------------------------------
+      # Show runner IP (only if selected)
+      # ----------------------------------------------------
       - name: Show runner public IP + country
-        if: env.SKIP != 'true'
+        if: steps.probe_check.outputs.run_probe == 'true'
         shell: bash
         run: |
-          set -euo pipefail
-          RUNNER_IP="$(curl -s https://api.ipify.org || true)"
-          RUNNER_COUNTRY="$(curl -s https://ipinfo.io/country || true)"
+          RUNNER_IP="$(curl -s https://api.ipify.org || echo unknown)"
+          RUNNER_COUNTRY="$(curl -s https://ipinfo.io/country || echo unknown)"
           echo "Runner public IP: ${RUNNER_IP}"
           echo "Runner country: ${RUNNER_COUNTRY}"
           echo "RUNNER_IP=${RUNNER_IP}" >> "$GITHUB_ENV"
           echo "RUNNER_COUNTRY=${RUNNER_COUNTRY}" >> "$GITHUB_ENV"
 
+      # ----------------------------------------------------
+      # Run Health Check
+      # ----------------------------------------------------
       - name: Run HC test with --resolve
-        if: env.SKIP != 'true'
+        if: steps.probe_check.outputs.run_probe == 'true'
         shell: bash
         env:
           URL: ${{ inputs.url }}
@@ -98,22 +102,23 @@ jobs:
           RUNNER_IP: ${{ env.RUNNER_IP }}
           RUNNER_COUNTRY: ${{ env.RUNNER_COUNTRY }}
         run: |
-          set -euo pipefail
 
-          if ! [[ "$DURATION" =~ ^[0-9]+$ ]]; then echo "Invalid seconds value"; exit 1; fi
-          if ! [[ "$INTERVAL_MS" =~ ^[0-9]+$ ]]; then echo "Invalid interval_ms value"; exit 1; fi
-          if ! [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "Invalid IPv4 format"; exit 1; fi
+          # Basic validation
+          [[ "$DURATION" =~ ^[0-9]+$ ]] || { echo "Invalid seconds"; exit 1; }
+          [[ "$INTERVAL_MS" =~ ^[0-9]+$ ]] || { echo "Invalid interval_ms"; exit 1; }
+          [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid IPv4"; exit 1; }
 
           host="$(echo "$URL" | sed -E 's#^https?://([^/:]+).*#\1#')"
           proto="$(echo "$URL" | sed -E 's#^(https?).*#\1#')"
-          if [ "$proto" != "https" ]; then echo "Only https supported"; exit 1; fi
+          [ "$proto" = "https" ] || { echo "Only https supported"; exit 1; }
           port="443"
 
           result_file="results_agent_${AGENT}.csv"
           echo "ts,agent,runner_ip,runner_country,http_code,remote_ip,ssl_verify_result,time_connect,time_appconnect,time_starttransfer,time_total" > "$result_file"
 
           start_epoch="$(date +%s)"
-          end_epoch="$((start_epoch + DURATION))"
+          end_epoch=$((start_epoch + DURATION))
+
           count=0
           errors=0
 
@@ -136,26 +141,45 @@ jobs:
               curl_args=(-k "${curl_args[@]}")
             fi
 
-            out="$(curl "${curl_args[@]}" 2>&1)" || {
+            out="$(curl "${curl_args[@]}" 2>/dev/null)"
+            rc=$?
+
+            if [ $rc -ne 0 ]; then
               out="curl_error,0,0,0,0,0,0"
               errors=$((errors+1))
-            }
+            else
+              http_code="$(echo "$out" | cut -d',' -f1)"
+              if [[ "$http_code" -ge 400 ]] || [[ "$http_code" -eq 000 ]]; then
+                errors=$((errors+1))
+              fi
+            fi
 
             echo "${ts},${AGENT},${RUNNER_IP:-},${RUNNER_COUNTRY:-},${out}" >> "$result_file"
 
             sleep "$(awk "BEGIN {print $INTERVAL_MS/1000}")"
           done
 
+          if [ "$count" -eq 0 ]; then
+            echo "No requests executed"
+            exit 1
+          fi
+
           error_rate=$((errors * 100 / count))
-          echo "Agent $AGENT finished. Error rate: ${error_rate}%"
+          echo "Agent $AGENT finished"
+          echo "Total requests: $count"
+          echo "Total errors: $errors"
+          echo "Error rate: ${error_rate}%"
 
           if [ "$error_rate" -gt "$FAIL_THRESHOLD" ]; then
             echo "Error rate exceeds threshold (${FAIL_THRESHOLD}%)"
             exit 1
           fi
 
+      # ----------------------------------------------------
+      # Upload Results
+      # ----------------------------------------------------
       - name: Upload per-agent results
-        if: env.SKIP != 'true'
+        if: steps.probe_check.outputs.run_probe == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: hc-results-agent-${{ matrix.agent }}
