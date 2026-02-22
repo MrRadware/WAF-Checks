@@ -44,11 +44,7 @@ on:
 jobs:
   hc_test:
     name: Run HC Test on Multiple Agents
-    runs-on: ${{ 
-      github.event.inputs.runner_region == 'europe' && 'ubuntu-20.04' || 
-      github.event.inputs.runner_region == 'asia' && 'ubuntu-22.04' || 
-      'ubuntu-latest' 
-    }}
+    runs-on: ${{ fromJSON('{"us":"ubuntu-latest","europe":"ubuntu-20.04","asia":"ubuntu-22.04"}')[github.event.inputs.runner_region] }}
     strategy:
       fail-fast: false
       max-parallel: 3
@@ -79,6 +75,7 @@ jobs:
           FAIL_THRESHOLD: ${{ inputs.fail_threshold_pct }}
           RUNNER_IP: ${{ env.RUNNER_IP }}
           RUNNER_COUNTRY: ${{ env.RUNNER_COUNTRY }}
+          REGION: ${{ inputs.runner_region }}
         run: |
           set -euo pipefail
 
@@ -93,7 +90,7 @@ jobs:
           if [ "$proto" != "https" ]; then echo "Only https supported"; exit 1; fi
           port="443"
 
-          echo "agent=$AGENT region=${{ github.event.inputs.runner_region }} url=$URL host=$host ip=$IP duration=${DURATION}s interval_ms=$INTERVAL_MS insecure_tls=$INSECURE_TLS runner_ip=${RUNNER_IP:-} runner_country=${RUNNER_COUNTRY:-}"
+          echo "agent=$AGENT region=$REGION url=$URL host=$host ip=$IP duration=${DURATION}s interval_ms=$INTERVAL_MS insecure_tls=$INSECURE_TLS runner_ip=${RUNNER_IP:-} runner_country=${RUNNER_COUNTRY:-}"
 
           result_file="results_agent_${AGENT}.csv"
           echo "ts,agent,region,runner_ip,runner_country,http_code,remote_ip,ssl_verify_result,time_connect,time_appconnect,time_starttransfer,time_total" > "$result_file"
@@ -129,7 +126,7 @@ jobs:
               errors=$((errors+1))
             fi
 
-            echo "${ts},${AGENT},${{ github.event.inputs.runner_region }},${RUNNER_IP:-},${RUNNER_COUNTRY:-},${out}" | tee -a "$result_file" >/dev/null
+            echo "${ts},${AGENT},${REGION},${RUNNER_IP:-},${RUNNER_COUNTRY:-},${out}" | tee -a "$result_file" >/dev/null
 
             jitter=$(shuf -i 0-200 -n 1)
             sleep "$(awk "BEGIN {print ($INTERVAL_MS + $jitter)/1000}")"
@@ -147,5 +144,5 @@ jobs:
       - name: Upload per-agent results
         uses: actions/upload-artifact@v4
         with:
-          name: hc-results-${{ github.event.inputs.runner_region }}-agent-${{ matrix.agent }}
+          name: hc-results-${{ inputs.runner_region }}-agent-${{ matrix.agent }}
           path: results_agent_${{ matrix.agent }}.csv
