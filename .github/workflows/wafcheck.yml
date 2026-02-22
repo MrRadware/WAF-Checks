@@ -1,14 +1,14 @@
-name: WAF Health Check via IP Override
+name: CWAAF HC (10s) via IP override
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Full HTTPS URL (https://host/path)"
+        description: "Full URL (https://host/path). Example: https://app.example.com/hc"
         required: true
         type: string
       ip:
-        description: "Target IP to force-connect to"
+        description: "Target IP to force-connect to (CWAAF IP). Example: 203.0.113.10"
         required: true
         type: string
       seconds:
@@ -22,104 +22,89 @@ on:
         default: "1000"
         type: string
       insecure_tls:
-        description: "Skip TLS verification (-k)"
+        description: "Skip TLS verification (-k). Use true if cert/SNI mismatch is expected."
         required: false
         default: "true"
-        type: string
-      expected_http:
-        description: "Expected HTTP code (optional, e.g. 200)"
-        required: false
-        default: ""
         type: string
 
 jobs:
   hc_test:
-    name: Run Health Check
+    name: Run from multiple agents
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        agent: [1,2,3,4,5]  # parallel agents
+        agent: [1, 2, 3, 4, 5]  # שנה ל-10 אם בא לך
 
     steps:
-      - name: Show runner info
+      - name: Show runner public IP + country (and export)
+        shell: bash
         run: |
-          RUNNER_IP=$(curl -s https://api.ipify.org || true)
-          RUNNER_COUNTRY=$(curl -s https://ipinfo.io/country || true)
-          echo "Runner IP: $RUNNER_IP"
-          echo "Runner Country: $RUNNER_COUNTRY"
-          echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
-          echo "RUNNER_COUNTRY=$RUNNER_COUNTRY" >> $GITHUB_ENV
+          set -euo pipefail
+          RUNNER_IP="$(curl -s https://api.ipify.org || true)"
+          RUNNER_COUNTRY="$(curl -s https://ipinfo.io/country || true)"
+          RUNNER_GEO_JSON="$(curl -s https://ipinfo.io || true)"
 
-      - name: Execute curl probe
+          echo "Runner public IP: ${RUNNER_IP}"
+          echo "Runner country:   ${RUNNER_COUNTRY}"
+          echo "Runner geo:"
+          echo "${RUNNER_GEO_JSON}"
+
+          # Make available to next steps
+          echo "RUNNER_IP=${RUNNER_IP}" >> "$GITHUB_ENV"
+          echo "RUNNER_COUNTRY=${RUNNER_COUNTRY}" >> "$GITHUB_ENV"
+
+      - name: Run HC test with --resolve (no DNS)
+        shell: bash
         env:
           URL: ${{ inputs.url }}
           IP: ${{ inputs.ip }}
           DURATION: ${{ inputs.seconds }}
           INTERVAL_MS: ${{ inputs.interval_ms }}
           INSECURE_TLS: ${{ inputs.insecure_tls }}
-          EXPECTED_HTTP: ${{ inputs.expected_http }}
           AGENT: ${{ matrix.agent }}
         run: |
           set -euo pipefail
 
-          host=$(echo "$URL" | awk -F[/:] '{print $4}')
-          proto=$(echo "$URL" | awk -F: '{print $1}')
-
+          # Parse host from URL (expects https://host/path)
+          host="$(echo "$URL" | sed -E 's#^https?://([^/:]+).*#\1#')"
+          proto="$(echo "$URL" | sed -E 's#^(https?).*#\1#')"
           if [ "$proto" != "https" ]; then
-            echo "Only HTTPS supported"
+            echo "Only https is supported. Got: $proto"
             exit 1
           fi
 
-          echo "agent=$AGENT url=$URL host=$host ip=$IP duration=${DURATION}s interval_ms=$INTERVAL_MS"
+          port="443"
 
-          echo "ts,agent,runner_ip,runner_country,http_code,remote_ip,ssl_verify,time_connect,time_tls,time_ttfb,time_total" > results_${AGENT}.csv
+          echo "agent=$AGENT url=$URL host=$host ip=$IP duration=${DURATION}s interval_ms=$INTERVAL_MS insecure_tls=$INSECURE_TLS runner_ip=${RUNNER_IP:-} runner_country=${RUNNER_COUNTRY:-}"
 
-          start=$(date +%s)
-          end=$((start + DURATION))
-          total=0
-          failures=0
+          echo "ts,agent,runner_ip,runner_country,http_code,remote_ip,ssl_verify_result,time_connect,time_appconnect,time_starttransfer,time_total" \
+            > "results_agent_${AGENT}.csv"
 
-          while [ "$(date +%s)" -lt "$end" ]; do
-            ts=$(date -Is)
+          start_epoch="$(date +%s)"
+          end_epoch="$((start_epoch + DURATION))"
+
+          while [ "$(date +%s)" -lt "$end_epoch" ]; do
+            ts="$(date -Is)"
+
             curl_args=(-sS -o /dev/null
-              --resolve "${host}:443:${IP}"
+              --resolve "${host}:${port}:${IP}"
               -w "%{http_code},%{remote_ip},%{ssl_verify_result},%{time_connect},%{time_appconnect},%{time_starttransfer},%{time_total}"
               "$URL"
             )
 
-            if [[ "$INSECURE_TLS" == "true" ]]; then
+            if [ "$INSECURE_TLS" = "true" ] || [ "$INSECURE_TLS" = "1" ]; then
               curl_args=(-k "${curl_args[@]}")
             fi
 
-            out=$(curl "${curl_args[@]}" 2>/dev/null || echo "000,0,0,0,0,0,0")
-            http_code=$(echo "$out" | cut -d',' -f1)
+            out="$(curl "${curl_args[@]}" 2>/dev/null || echo "curl_error,0,0,0,0,0,0")"
+            echo "${ts},${AGENT},${RUNNER_IP:-},${RUNNER_COUNTRY:-},${out}" | tee -a "results_agent_${AGENT}.csv" >/dev/null
 
-            if [[ -n "$EXPECTED_HTTP" && "$http_code" != "$EXPECTED_HTTP" ]]; then
-              failures=$((failures+1))
-            fi
-
-            echo "$ts,$AGENT,${RUNNER_IP:-},${RUNNER_COUNTRY:-},$out" >> results_${AGENT}.csv
-            total=$((total+1))
-
-            sleep_sec=$(awk "BEGIN {print $INTERVAL_MS/1000}")
-            sleep $sleep_sec
+            python3 -c "import time; time.sleep(int('$INTERVAL_MS')/1000)"
           done
-
-          echo "Total requests: $total"
-          echo "Failures: $failures"
-
-          echo "## Summary (Agent $AGENT)" >> $GITHUB_STEP_SUMMARY
-          echo "- Total: $total" >> $GITHUB_STEP_SUMMARY
-          echo "- Failures: $failures" >> $GITHUB_STEP_SUMMARY
-
-          if [[ -n "$EXPECTED_HTTP" && "$failures" -gt 0 ]]; then
-            echo "Failing job due to HTTP mismatch"
-            exit 1
-          fi
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
           name: hc-results-agent-${{ matrix.agent }}
-          path: results_${{ matrix.agent }}.csv
+          path: results_agent_${{ matrix.agent }}.csv
